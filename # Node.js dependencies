@@ -1,0 +1,12 @@
+# Node.js dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Figma plugin files
+*.figplug
+
+# OS-specific files
+.DS_Store
+Thumbs.db

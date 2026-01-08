@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Figma Plugin UI</title>
+</head>
+<body>
+  <h1>Welcome to My Figma Plugin</h1>
+  <button id="close-button">Close Plugin</button>
+  <script>
+    document.getElementById('close-button').addEventListener('click', () => {
+      parent.postMessage({ pluginMessage: { type: 'close-plugin' } }, '*');
+    });
+  </script>
+</body>
+</html>
