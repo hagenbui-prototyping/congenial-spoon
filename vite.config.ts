@@ -7,7 +7,7 @@ export default defineConfig({
   root: 'src/ui',
   build: {
     outDir: '../../dist',
-    emptyOutDir: false,
+    emptyOutDir: true,
     rollupOptions: {
       input: 'src/ui/index.html',
       output: {

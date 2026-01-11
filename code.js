@@ -9,18 +9,79 @@ function rgbToHex(r, g, b) {
 }
 // Format color value from variable
 function formatColorValue(value) {
-    if (value.r !== undefined && value.g !== undefined && value.b !== undefined) {
-        if (value.a !== undefined && value.a < 1) {
+    if (typeof value === 'object' && value !== null && 'r' in value && 'g' in value && 'b' in value) {
+        if ('a' in value && value.a !== undefined && value.a < 1) {
             return `rgba(${Math.round(value.r * 255)}, ${Math.round(value.g * 255)}, ${Math.round(value.b * 255)}, ${value.a})`;
         }
         return rgbToHex(value.r, value.g, value.b);
     }
     return String(value);
 }
+// ===== Plugin Data Management =====
+function getColorScaleGroupMetadata() {
+    const data = figma.root.getPluginData('colorScaleGroups');
+    if (!data) {
+        return { collectionIds: [], variableIds: [] };
+    }
+    try {
+        return JSON.parse(data);
+    }
+    catch (error) {
+        return { collectionIds: [], variableIds: [] };
+    }
+}
+function saveColorScaleGroupMetadata(metadata) {
+    figma.root.setPluginData('colorScaleGroups', JSON.stringify(metadata));
+}
+function markAsColorScaleGroup(ids, markType) {
+    const metadata = getColorScaleGroupMetadata();
+    if (markType === 'collection') {
+        ids.forEach(id => {
+            if (!metadata.collectionIds.includes(id)) {
+                metadata.collectionIds.push(id);
+            }
+        });
+    }
+    else {
+        ids.forEach(id => {
+            if (!metadata.variableIds.includes(id)) {
+                metadata.variableIds.push(id);
+            }
+        });
+    }
+    saveColorScaleGroupMetadata(metadata);
+    return metadata;
+}
+function unmarkColorScaleGroup(ids, markType) {
+    const metadata = getColorScaleGroupMetadata();
+    if (markType === 'collection') {
+        metadata.collectionIds = metadata.collectionIds.filter(id => !ids.includes(id));
+    }
+    else {
+        metadata.variableIds = metadata.variableIds.filter(id => !ids.includes(id));
+    }
+    saveColorScaleGroupMetadata(metadata);
+    return metadata;
+}
+// ===== Collection Management =====
+async function getLocalCollections() {
+    const collections = await figma.variables.getLocalVariableCollectionsAsync();
+    const metadata = getColorScaleGroupMetadata();
+    return collections.map(collection => ({
+        id: collection.id,
+        name: collection.name,
+        modes: collection.modes.map(mode => ({
+            modeId: mode.modeId,
+            name: mode.name
+        })),
+        isColorScaleGroup: metadata.collectionIds.includes(collection.id)
+    }));
+}
 // Read Variables (Colors and Typography)
 async function readVariables() {
     const variables = [];
     const localVariables = await figma.variables.getLocalVariablesAsync();
+    const metadata = getColorScaleGroupMetadata();
     for (const variable of localVariables) {
         const isColorVariable = variable.resolvedType === 'COLOR';
         const isTypographyVariable = variable.resolvedType === 'FLOAT' &&
@@ -31,6 +92,7 @@ async function readVariables() {
                 variable.name.toLowerCase().includes('spacing') ||
                 variable.name.toLowerCase().includes('scale'));
         if (isColorVariable || isTypographyVariable) {
+            const collection = await figma.variables.getVariableCollectionByIdAsync(variable.variableCollectionId);
             const modeId = Object.keys(variable.valuesByMode)[0];
             const value = variable.valuesByMode[modeId];
             let formattedValue = '';
@@ -45,6 +107,9 @@ async function readVariables() {
                 name: variable.name,
                 type: variable.resolvedType,
                 value: formattedValue,
+                collectionId: variable.variableCollectionId,
+                collectionName: collection ? collection.name : 'Unknown',
+                isColorScaleGroup: metadata.variableIds.includes(variable.id),
             });
         }
     }
@@ -129,6 +194,227 @@ function parseColorValue(value) {
     }
     return null;
 }
+// ===== Color Scale Generation - Utilities =====
+function hexToRgb(hex) {
+    const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+    if (!result)
+        throw new Error('Invalid hex color');
+    return {
+        r: parseInt(result[1], 16) / 255,
+        g: parseInt(result[2], 16) / 255,
+        b: parseInt(result[3], 16) / 255,
+    };
+}
+function rgbToHsl(r, g, b) {
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    let h = 0, s = 0;
+    const l = (max + min) / 2;
+    if (max !== min) {
+        const d = max - min;
+        s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+        switch (max) {
+            case r:
+                h = ((g - b) / d + (g < b ? 6 : 0)) / 6;
+                break;
+            case g:
+                h = ((b - r) / d + 2) / 6;
+                break;
+            case b:
+                h = ((r - g) / d + 4) / 6;
+                break;
+        }
+    }
+    return { h, s, l };
+}
+function hslToRgb(h, s, l) {
+    let r, g, b;
+    if (s === 0) {
+        r = g = b = l;
+    }
+    else {
+        const hue2rgb = (p, q, t) => {
+            if (t < 0)
+                t += 1;
+            if (t > 1)
+                t -= 1;
+            if (t < 1 / 6)
+                return p + (q - p) * 6 * t;
+            if (t < 1 / 2)
+                return q;
+            if (t < 2 / 3)
+                return p + (q - p) * (2 / 3 - t) * 6;
+            return p;
+        };
+        const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+        const p = 2 * l - q;
+        r = hue2rgb(p, q, h + 1 / 3);
+        g = hue2rgb(p, q, h);
+        b = hue2rgb(p, q, h - 1 / 3);
+    }
+    return { r, g, b };
+}
+// ===== Color Scale Algorithms =====
+function generateTintShadeScale(baseHex, steps) {
+    const base = hexToRgb(baseHex);
+    const scale = new Map();
+    const baseStep = 500;
+    steps.forEach((step) => {
+        if (step === baseStep) {
+            scale.set(step, base);
+        }
+        else if (step < baseStep) {
+            // Tint (mix with white)
+            const ratio = (baseStep - step) / baseStep;
+            const tintAmount = ratio * 0.95;
+            scale.set(step, {
+                r: base.r + (1 - base.r) * tintAmount,
+                g: base.g + (1 - base.g) * tintAmount,
+                b: base.b + (1 - base.b) * tintAmount,
+            });
+        }
+        else {
+            // Shade (mix with black)
+            const ratio = (step - baseStep) / (1000 - baseStep);
+            const shadeAmount = ratio * 0.85;
+            scale.set(step, {
+                r: base.r * (1 - shadeAmount),
+                g: base.g * (1 - shadeAmount),
+                b: base.b * (1 - shadeAmount),
+            });
+        }
+    });
+    return scale;
+}
+function generateHslLightnessScale(baseHex, steps) {
+    const baseRgb = hexToRgb(baseHex);
+    const baseHsl = rgbToHsl(baseRgb.r, baseRgb.g, baseRgb.b);
+    const scale = new Map();
+    const baseStep = 500;
+    steps.forEach((step) => {
+        if (step === baseStep) {
+            scale.set(step, baseRgb);
+        }
+        else if (step < baseStep) {
+            const ratio = (baseStep - step) / baseStep;
+            const newL = baseHsl.l + (0.95 - baseHsl.l) * ratio;
+            scale.set(step, hslToRgb(baseHsl.h, baseHsl.s, newL));
+        }
+        else {
+            const ratio = (step - baseStep) / (1000 - baseStep);
+            const newL = baseHsl.l * (1 - ratio * 0.85);
+            scale.set(step, hslToRgb(baseHsl.h, baseHsl.s, newL));
+        }
+    });
+    return scale;
+}
+function generateHslSaturationScale(baseHex, steps) {
+    const baseRgb = hexToRgb(baseHex);
+    const baseHsl = rgbToHsl(baseRgb.r, baseRgb.g, baseRgb.b);
+    const scale = new Map();
+    const baseStep = 500;
+    steps.forEach((step) => {
+        if (step === baseStep) {
+            scale.set(step, baseRgb);
+        }
+        else if (step < baseStep) {
+            const ratio = (baseStep - step) / baseStep;
+            const newL = baseHsl.l + (0.95 - baseHsl.l) * ratio;
+            const newS = baseHsl.s * (1 - ratio * 0.4);
+            scale.set(step, hslToRgb(baseHsl.h, newS, newL));
+        }
+        else {
+            const ratio = (step - baseStep) / (1000 - baseStep);
+            const newL = baseHsl.l * (1 - ratio * 0.85);
+            const newS = Math.min(1, baseHsl.s * (1 + ratio * 0.2));
+            scale.set(step, hslToRgb(baseHsl.h, newS, newL));
+        }
+    });
+    return scale;
+}
+function generatePerceptualScale(baseHex, steps) {
+    const baseRgb = hexToRgb(baseHex);
+    const scale = new Map();
+    const gamma = 2.2;
+    const baseStep = 500;
+    const toLinear = (c) => Math.pow(c, gamma);
+    const fromLinear = (c) => Math.pow(c, 1 / gamma);
+    const baseLinear = {
+        r: toLinear(baseRgb.r),
+        g: toLinear(baseRgb.g),
+        b: toLinear(baseRgb.b),
+    };
+    steps.forEach((step) => {
+        if (step === baseStep) {
+            scale.set(step, baseRgb);
+        }
+        else if (step < baseStep) {
+            const ratio = (baseStep - step) / baseStep;
+            const tintAmount = ratio * 0.95;
+            scale.set(step, {
+                r: fromLinear(baseLinear.r + (1 - baseLinear.r) * tintAmount),
+                g: fromLinear(baseLinear.g + (1 - baseLinear.g) * tintAmount),
+                b: fromLinear(baseLinear.b + (1 - baseLinear.b) * tintAmount),
+            });
+        }
+        else {
+            const ratio = (step - baseStep) / (1000 - baseStep);
+            const shadeAmount = ratio * 0.85;
+            scale.set(step, {
+                r: fromLinear(baseLinear.r * (1 - shadeAmount)),
+                g: fromLinear(baseLinear.g * (1 - shadeAmount)),
+                b: fromLinear(baseLinear.b * (1 - shadeAmount)),
+            });
+        }
+    });
+    return scale;
+}
+function generateColorScale(config) {
+    switch (config.algorithm) {
+        case 'tint-shade':
+            return generateTintShadeScale(config.baseColor, config.steps);
+        case 'hsl-lightness':
+            return generateHslLightnessScale(config.baseColor, config.steps);
+        case 'hsl-saturation':
+            return generateHslSaturationScale(config.baseColor, config.steps);
+        case 'perceptual-lightness':
+            return generatePerceptualScale(config.baseColor, config.steps);
+        default:
+            return generateTintShadeScale(config.baseColor, config.steps);
+    }
+}
+// ===== Variable Creation for Color Scale =====
+async function createColorScaleVariables(config) {
+    const scale = generateColorScale(config);
+    const createdIds = [];
+    let collection;
+    if (config.targetCollectionId) {
+        const found = await figma.variables.getVariableCollectionByIdAsync(config.targetCollectionId);
+        if (!found) {
+            throw new Error('Target collection not found');
+        }
+        collection = found;
+    }
+    else {
+        collection = figma.variables.createVariableCollection(`${config.baseName} Color Scale`);
+    }
+    const modeId = collection.modes[0].modeId;
+    for (const [step, rgb] of scale.entries()) {
+        const variableName = `${config.baseName}/${step}`;
+        const existingVars = await figma.variables.getLocalVariablesAsync();
+        let variable = existingVars.find((v) => v.name === variableName && v.variableCollectionId === collection.id);
+        if (!variable) {
+            const collectionObj = await figma.variables.getVariableCollectionByIdAsync(collection.id);
+            if (!collectionObj) {
+                throw new Error(`Collection not found: ${collection.id}`);
+            }
+            variable = figma.variables.createVariable(variableName, collectionObj, 'COLOR');
+        }
+        variable.setValueForMode(modeId, rgb);
+        createdIds.push(variable.id);
+    }
+    return createdIds;
+}
 // Update a single variable
 async function updateVariable(id, newValue) {
     try {
@@ -181,40 +467,106 @@ async function scaleTypographyVariables(variableIds, factor) {
 figma.showUI(__html__, { width: 800, height: 600 });
 // Message handler
 figma.ui.onmessage = async (msg) => {
-    if (msg.type === 'read-data') {
-        const variables = await readVariables();
-        const styles = await readStyles();
-        figma.ui.postMessage({
-            type: 'data-loaded',
-            variables,
-            styles,
-        });
-    }
-    else if (msg.type === 'update-variable') {
-        const success = await updateVariable(msg.id, msg.value);
-        if (success) {
-            // Refresh data
+    try {
+        if (msg.type === 'read-data') {
+            const variables = await readVariables();
+            const styles = await readStyles();
+            const collections = await getLocalCollections();
+            const colorScaleMetadata = getColorScaleGroupMetadata();
+            figma.ui.postMessage({
+                type: 'data-loaded',
+                variables,
+                styles,
+                collections,
+                colorScaleMetadata,
+            });
+        }
+        else if (msg.type === 'get-collections') {
+            const collections = await getLocalCollections();
+            figma.ui.postMessage({
+                type: 'collections-loaded',
+                collections,
+            });
+        }
+        else if (msg.type === 'mark-color-scale-group') {
+            const metadata = markAsColorScaleGroup(msg.variableIds || [msg.collectionId], msg.markType);
+            const variables = await readVariables();
+            const collections = await getLocalCollections();
+            figma.ui.postMessage({
+                type: 'color-scale-group-updated',
+                variables,
+                collections,
+                colorScaleMetadata: metadata,
+            });
+        }
+        else if (msg.type === 'unmark-color-scale-group') {
+            const metadata = unmarkColorScaleGroup(msg.variableIds || [msg.collectionId], msg.markType);
+            const variables = await readVariables();
+            const collections = await getLocalCollections();
+            figma.ui.postMessage({
+                type: 'color-scale-group-updated',
+                variables,
+                collections,
+                colorScaleMetadata: metadata,
+            });
+        }
+        else if (msg.type === 'update-variable') {
+            const success = await updateVariable(msg.id, msg.value);
+            if (success) {
+                const variables = await readVariables();
+                figma.ui.postMessage({
+                    type: 'variable-updated',
+                    variables,
+                });
+            }
+            else {
+                figma.ui.postMessage({
+                    type: 'error',
+                    message: 'Failed to update variable',
+                });
+            }
+        }
+        else if (msg.type === 'scale-typography') {
+            const successCount = await scaleTypographyVariables(msg.variableIds, msg.factor);
             const variables = await readVariables();
             figma.ui.postMessage({
-                type: 'variable-updated',
+                type: 'variables-scaled',
                 variables,
+                successCount,
             });
         }
-        else {
+        else if (msg.type === 'preview-color-scale') {
+            const scale = generateColorScale(msg.colorScaleConfig);
+            const previews = [];
+            for (const [step, rgb] of scale.entries()) {
+                previews.push({
+                    step,
+                    color: rgbToHex(rgb.r, rgb.g, rgb.b),
+                    variableName: `${msg.colorScaleConfig.baseName}/${step}`,
+                });
+            }
             figma.ui.postMessage({
-                type: 'error',
-                message: 'Failed to update variable',
+                type: 'data-loaded',
+                colorScalePreviews: previews,
+            });
+        }
+        else if (msg.type === 'generate-color-scale') {
+            const createdIds = await createColorScaleVariables(msg.colorScaleConfig);
+            const variables = await readVariables();
+            const collections = await getLocalCollections();
+            figma.ui.postMessage({
+                type: 'color-scale-generated',
+                variables,
+                collections,
+                createdVariableIds: createdIds,
+                successCount: createdIds.length,
             });
         }
     }
-    else if (msg.type === 'scale-typography') {
-        const successCount = await scaleTypographyVariables(msg.variableIds, msg.factor);
-        // Refresh data
-        const variables = await readVariables();
+    catch (error) {
         figma.ui.postMessage({
-            type: 'variables-scaled',
-            variables,
-            successCount,
+            type: 'error',
+            message: error instanceof Error ? error.message : 'Unknown error',
         });
     }
 };
